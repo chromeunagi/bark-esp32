@@ -4,19 +4,31 @@
 #include <WiFiManager.h>
 #include <time.h>
 #include <base64.h>
+#include <base64.h>
+#include <ArduinoJson.h>
 
-const uint16_t SAMPLE_SIZE = 256;          // Must be a power of 2
-const double SAMPLING_FREQUENCY = 10000;   // Hz
+// Audio buffer configuration
+const uint16_t SAMPLE_SIZE = 256;         // FFT size (keep this for frequency analysis)
+const double SAMPLING_FREQUENCY = 5000;  // Reduced to 5kHz for lower quality but manageable size
 const float VOLUME_THRESHOLD = 0.45;
 
+// Circular buffer for 2 seconds of audio
+const int BUFFER_DURATION_SECONDS = 1;
+const int AUDIO_BUFFER_SIZE = SAMPLING_FREQUENCY * BUFFER_DURATION_SECONDS;  // 10,000 samples
+uint16_t audioBuffer[AUDIO_BUFFER_SIZE];
+int bufferIndex = 0;
+bool bufferFull = false;
+
+// FFT arrays (separate from audio buffer)
 double vReal[SAMPLE_SIZE];
 double vImag[SAMPLE_SIZE];
-
 ArduinoFFT FFT = ArduinoFFT(vReal, vImag, SAMPLE_SIZE, SAMPLING_FREQUENCY);
 
 const int micPin = 36;
 unsigned long lastBarkTime = 0;
 const unsigned long COOLDOWN_MS = 3000;
+
+static StaticJsonDocument<1024> doc;
 
 void setup() {
   Serial.begin(115200);
@@ -46,58 +58,79 @@ void setup() {
 }
 
 void loop() {
-  // === 1. Capture mic samples ===
-  for (int i = 0; i < SAMPLE_SIZE; i++) {
-    vReal[i] = analogRead(micPin);
-    vImag[i] = 0;
-    delayMicroseconds(100);  // 10kHz sampling
-  }
-
-  // === 2. Compute volume (RMS) ===
-  double rms = 0;
-  for (int i = 0; i < SAMPLE_SIZE; i++) {
-    rms += sq(vReal[i]);
-  }
-  rms = sqrt(rms / SAMPLE_SIZE);
-  double volume = rms / 4095.0;  // Normalize (0–1)
-
-  // === 3. Apply FFT (after DC bias removal) ===
-  double avg = 0;
-  for (int i = 0; i < SAMPLE_SIZE; i++) avg += vReal[i];
-  avg /= SAMPLE_SIZE;
-  for (int i = 0; i < SAMPLE_SIZE; i++) vReal[i] -= avg;
-
-  FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
-  FFT.compute(FFT_FORWARD);
-  FFT.complexToMagnitude();
-
-  // === 4. Find dominant frequency ===
-  double maxMag = 0;
-  int maxIndex = 0;
-  for (int i = 1; i < SAMPLE_SIZE / 2; i++) {
-    if (vReal[i] > maxMag) {
-      maxMag = vReal[i];
-      maxIndex = i;
+  // === 1. Continuously capture and store audio samples ===
+  uint16_t currentSample = analogRead(micPin);
+  
+  // Store in circular buffer
+  audioBuffer[bufferIndex] = currentSample;
+  bufferIndex = (bufferIndex + 1) % AUDIO_BUFFER_SIZE;
+  if (bufferIndex == 0) bufferFull = true;  // Buffer has wrapped around
+  
+  // === 2. Every 256 samples, do FFT analysis ===
+  static int analysisCounter = 0;
+  analysisCounter++;
+  
+  if (analysisCounter >= 256) {  // Analyze every 256 samples (~51ms at 5kHz)
+    analysisCounter = 0;
+    
+    // Copy recent samples for FFT analysis
+    int startIdx = (bufferIndex - SAMPLE_SIZE + AUDIO_BUFFER_SIZE) % AUDIO_BUFFER_SIZE;
+    for (int i = 0; i < SAMPLE_SIZE; i++) {
+      int idx = (startIdx + i) % AUDIO_BUFFER_SIZE;
+      vReal[i] = audioBuffer[idx];
+      vImag[i] = 0;
+    }
+    
+    // === 3. Compute volume (RMS) ===
+    double rms = 0;
+    for (int i = 0; i < SAMPLE_SIZE; i++) {
+      rms += sq(vReal[i]);
+    }
+    rms = sqrt(rms / SAMPLE_SIZE);
+    double volume = rms / 4095.0;  // Normalize (0–1)
+    
+    // === 4. Apply FFT for frequency analysis ===
+    double avg = 0;
+    for (int i = 0; i < SAMPLE_SIZE; i++) avg += vReal[i];
+    avg /= SAMPLE_SIZE;
+    for (int i = 0; i < SAMPLE_SIZE; i++) vReal[i] -= avg;
+    
+    FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+    FFT.compute(FFT_FORWARD);
+    FFT.complexToMagnitude();
+    
+    // === 5. Find dominant frequency ===
+    double maxMag = 0;
+    int maxIndex = 0;
+    for (int i = 1; i < SAMPLE_SIZE / 2; i++) {
+      if (vReal[i] > maxMag) {
+        maxMag = vReal[i];
+        maxIndex = i;
+      }
+    }
+    double frequency = (maxIndex * SAMPLING_FREQUENCY) / SAMPLE_SIZE;
+    
+    // === 6. Trigger bark event if loud enough and cooldown passed ===
+    if (volume > VOLUME_THRESHOLD) {
+      unsigned long now = millis();
+      if (now - lastBarkTime >= COOLDOWN_MS) {
+        lastBarkTime = now;
+        Serial.printf("⚠️  Possible bark: Vol=%.2f  Freq=%.1f Hz\n", volume, frequency);
+        
+        // Only send if we have enough data
+        if (bufferFull || bufferIndex > AUDIO_BUFFER_SIZE / 2) {
+          sendBarkWithAudio(volume, frequency);
+        }
+      } else {
+        Serial.println("🕒 Cooldown active — skipping bark");
+      }
     }
   }
-  double frequency = (maxIndex * SAMPLING_FREQUENCY) / SAMPLE_SIZE;
-
-  // === 5. Trigger bark event if loud enough and cooldown passed ===
-  if (volume > VOLUME_THRESHOLD) {
-    unsigned long now = millis();
-    if (now - lastBarkTime >= COOLDOWN_MS) {
-      lastBarkTime = now;
-      Serial.printf("⚠️  Possible bark: Vol=%.2f  Freq=%.1f Hz\n", volume, frequency);
-      sendSingleBark(volume, frequency);
-    } else {
-      Serial.println("🕒 Cooldown active — skipping bark");
-    }
-  }
-
-  delay(100);  // Short loop delay
+  
+  delayMicroseconds(200);  // 5kHz sampling rate
 }
 
-void sendSingleBark(float volume, float frequency) {
+void sendBarkWithAudio(float volume, float frequency) {
   if (WiFi.status() != WL_CONNECTED) return;
 
   HTTPClient http;
@@ -106,28 +139,42 @@ void sendSingleBark(float volume, float frequency) {
 
   time_t timestamp = time(nullptr);
 
-  // === Serialize audio data ===
-  String rawData = "";
-  for (int i = 0; i < SAMPLE_SIZE; i++)
-  {
-    rawData += (uint16_t)vReal[i]; // cast to 2-byte integer
-    rawData += ",";
+  // === Pack 2 seconds of audio data ===
+  int samplesToSend = bufferFull ? AUDIO_BUFFER_SIZE : bufferIndex;
+  uint8_t* audioBytes = (uint8_t*)malloc(samplesToSend * 2);  // 2 bytes per sample
+  
+  if (audioBytes == nullptr) {
+    Serial.println("❌ Failed to allocate memory for audio data");
+    return;
   }
-  rawData.remove(rawData.length() - 1); // remove trailing comma
+  
+  // Copy circular buffer data in correct order
+  int srcIdx = bufferFull ? bufferIndex : 0;  // Start from oldest sample if buffer is full
+  for (int i = 0; i < samplesToSend; i++) {
+    uint16_t sample = audioBuffer[(srcIdx + i) % AUDIO_BUFFER_SIZE];
+    audioBytes[i * 2] = sample & 0xFF;             // low byte
+    audioBytes[i * 2 + 1] = (sample >> 8) & 0xFF;  // high byte
+  }
 
-  String encoded = base64::encode(rawData);
+  // === Encode as base64 ===
+  String encoded = base64::encode(audioBytes, samplesToSend * 2);
+  free(audioBytes);  // Free allocated memory
+  
+  doc.clear();
+  doc["device_id"] = "esp32-yard";
+  doc["timestamp"] = timestamp;
+  doc["volume"] = volume;
+  doc["frequency"] = frequency;
+  doc["event"] = "possible_bark";
+  doc["audio_base64"] = encoded;
+  doc["sample_rate"] = (int)SAMPLING_FREQUENCY;
+  doc["duration_seconds"] = BUFFER_DURATION_SECONDS;
+  doc["num_samples"] = samplesToSend;
 
-  String json = "{";
-  json += "\"device_id\":\"esp32-yard\",";
-  json += "\"timestamp\":" + String(timestamp) + ",";
-  json += "\"volume\":" + String(volume, 3) + ",";
-  json += "\"frequency\":" + String(frequency, 1) + ",";
-  json += "\"audio_base64\":\"" + encoded + "\",";
-  json += "\"event\":\"possible_bark\"";
-  json += "}";
-
-  int code = http.POST(json);
-  Serial.printf("📤 Sent bark → HTTP %d\n", code);
+  String payload;
+  serializeJson(doc, payload);
+  int code = http.POST(payload);
+  Serial.printf("📤 Sent bark with %d samples → HTTP %d\n", samplesToSend, code);
   http.end();
 }
 
